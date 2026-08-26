@@ -1,3 +1,5 @@
+using SlotAutoPlay.Models;
+
 namespace SlotAutoPlay.Automation;
 
 public sealed record PendingSpin(string CorrelationId, DateTimeOffset StartedAtUtc);
@@ -17,6 +19,7 @@ public sealed class RoundCaptureState
     private string? lastCompletedCorrelationId;
     private MatchedRequest? matchedRequest;
     private TaskCompletionSource<MatchedRequest?>? completion;
+    private TaskCompletionSource<RoundResponseRecord?>? responseCompletion;
 
     public string? CurrentCorrelationId
     {
@@ -66,6 +69,8 @@ public sealed class RoundCaptureState
             matchedRequest = null;
             completion = new TaskCompletionSource<MatchedRequest?>(
                 TaskCreationOptions.RunContinuationsAsynchronously);
+            responseCompletion = new TaskCompletionSource<RoundResponseRecord?>(
+                TaskCreationOptions.RunContinuationsAsynchronously);
             return pending;
         }
     }
@@ -101,6 +106,20 @@ public sealed class RoundCaptureState
         lock (gate)
         {
             return matchedRequest;
+        }
+    }
+
+    /// <summary>
+    /// Returns the completion source a spin's response record is delivered to.
+    /// It is created once in <see cref="BeginSpin"/> and cleared by
+    /// <see cref="Complete"/>, so the response handler and the awaiting worker
+    /// always observe the same task regardless of scheduling order.
+    /// </summary>
+    public TaskCompletionSource<RoundResponseRecord?>? GetResponseCompletion()
+    {
+        lock (gate)
+        {
+            return responseCompletion;
         }
     }
 
@@ -145,6 +164,7 @@ public sealed class RoundCaptureState
             matchedRequest = null;
             completion?.TrySetResult(null);
             completion = null;
+            responseCompletion = null;
         }
     }
 

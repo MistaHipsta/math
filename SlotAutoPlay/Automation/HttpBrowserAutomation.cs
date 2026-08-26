@@ -18,7 +18,6 @@ public sealed class HttpBrowserAutomation : IAsyncDisposable
     private readonly List<Task> pendingLogTasks = [];
     private readonly RoundCaptureState captureState = new();
     private readonly Dictionary<IRequest, MatchedRequest> matchedRequests = [];
-    private readonly Dictionary<string, TaskCompletionSource<RoundResponseRecord?>> responseWaiters = [];
     private bool acceptingRequests = true;
     private bool disposed;
     private DateTimeOffset? lastNetworkActivity;
@@ -306,23 +305,17 @@ public sealed class HttpBrowserAutomation : IAsyncDisposable
             return null;
         }
 
-        TaskCompletionSource<RoundResponseRecord?> waiter;
-        lock (stateGate)
+        var responseCompletion = captureState.GetResponseCompletion();
+        if (responseCompletion is null)
         {
-            if (!responseWaiters.TryGetValue(
-                    request.Spin.CorrelationId,
-                    out waiter!))
-            {
-                waiter = new(TaskCreationOptions.RunContinuationsAsynchronously);
-                responseWaiters[request.Spin.CorrelationId] = waiter;
-            }
+            return null;
         }
 
         RoundResponseRecord? response;
         NormalizedRoundResult? parsedResult = null;
         try
         {
-            response = await waiter.Task.WaitAsync(
+            response = await responseCompletion.Task.WaitAsync(
                 config.LastResponseTimeout,
                 cancellationToken).ConfigureAwait(false);
         }
@@ -358,11 +351,6 @@ public sealed class HttpBrowserAutomation : IAsyncDisposable
             parsedResult = parser.Parse(parserRequest, parserResponse);
             await LogEventAsync("round_result", new { sessionId, result = parsedResult })
                 .ConfigureAwait(false);
-        }
-
-        lock (stateGate)
-        {
-            responseWaiters.Remove(request.Spin.CorrelationId);
         }
 
         captureState.Complete();
@@ -466,8 +454,6 @@ public sealed class HttpBrowserAutomation : IAsyncDisposable
         lock (stateGate)
         {
             matchedRequests[request] = matched;
-            responseWaiters[matched.Spin.CorrelationId] =
-                new(TaskCreationOptions.RunContinuationsAsynchronously);
         }
 
         var requestRecord = new RoundRequestRecord(
@@ -522,6 +508,7 @@ public sealed class HttpBrowserAutomation : IAsyncDisposable
         MatchedRequest matched)
     {
         RoundResponseRecord? record = null;
+        var responseCompletion = captureState.GetResponseCompletion();
 
         try
         {
@@ -605,12 +592,9 @@ public sealed class HttpBrowserAutomation : IAsyncDisposable
         {
             lock (stateGate)
             {
-                if (record is not null &&
-                    responseWaiters.TryGetValue(
-                        matched.Spin.CorrelationId,
-                        out var waiter))
+                if (record is not null && responseCompletion is not null)
                 {
-                    waiter.TrySetResult(record);
+                    responseCompletion.TrySetResult(record);
                 }
 
                 matchedRequests.Remove(response.Request);

@@ -28,3 +28,7 @@ __pycache__/
 *.py[cod] 
 tools/*-output.txt 
 tools/python-final.txt 
+# Local monitoring artifacts (not part of the repo)
+run-500-out.log
+run-500-err.log
+run-500.pid 

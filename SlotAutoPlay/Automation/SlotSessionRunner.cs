@@ -8,6 +8,8 @@ public sealed class SlotSessionRunner
     private readonly PlayConfig config;
     private readonly PlayOptions options;
     private int parsedRoundCount;
+    private long sessionStartedTimestamp;
+    private string? activeSessionId;
 
     public SlotSessionRunner(PlayConfig config, PlayOptions options)
     {
@@ -85,6 +87,8 @@ public sealed class SlotSessionRunner
         }
 
         var startedAt = Stopwatch.GetTimestamp();
+        sessionStartedTimestamp = startedAt;
+        activeSessionId = sessionId;
 
         while (!cancellationToken.IsCancellationRequested &&
                Stopwatch.GetElapsedTime(startedAt) < config.SessionMaxDuration)
@@ -174,9 +178,41 @@ public sealed class SlotSessionRunner
                     current + 1,
                     current) == current)
             {
-                return current + 1 == limit;
+                var newCount = current + 1;
+                TryReportProgress(newCount, limit);
+                return newCount == limit;
             }
         }
+    }
+
+    private void TryReportProgress(int count, int limit)
+    {
+        if (count % 50 != 0 && count != limit)
+        {
+            return;
+        }
+
+        if (sessionStartedTimestamp == 0)
+        {
+            return;
+        }
+
+        var elapsed = Stopwatch.GetElapsedTime(sessionStartedTimestamp);
+        var percent = (double)count / limit * 100;
+        double? etaMinutes = null;
+        if (count > 0)
+        {
+            var perRound = elapsed.TotalSeconds / count;
+            etaMinutes = (limit - count) * perRound / 60;
+        }
+
+        var now = DateTimeOffset.Now.ToString("HH:mm:ss");
+        var eta = etaMinutes is { } m
+            ? $" ETA≈{m:F0} min"
+            : "";
+        Console.WriteLine(
+            $"[{activeSessionId}] Progress: {count}/{limit} parsed " +
+            $"({percent:F1}%) elapsed={elapsed.TotalMinutes:F1}m{eta} @ {now}");
     }
 
     private static string Sanitize(string value)

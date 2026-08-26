@@ -483,13 +483,43 @@ public sealed class MoonSistersRoundParser : GenericJsonRoundParser
         if (!string.Equals(command, "play", StringComparison.OrdinalIgnoreCase) ||
             roundContainer is null)
         {
+            // A sync (or other non-round) response still represents a real
+            // wager: round_bet is deducted and user.balance changes. Keep its
+            // stake and balance (status Partial) so per-round metrics do not
+            // silently drop these spins from the RTP denominator.
+            var syncStake = spins is { } syncSpins
+                ? GetDecimal(syncSpins, "round_bet")
+                : null;
+            var syncBalance = user is { } syncUser
+                ? GetDecimal(syncUser, "balance")
+                : null;
+            var syncCurrency = user is { } syncUserCurrency
+                ? GetString(syncUserCurrency, "currency")
+                : null;
+            var syncHasFields = syncStake is not null ||
+                                syncBalance is not null ||
+                                syncCurrency is not null;
+
             return CreateResult(
-                RoundParseStatus.Unparsed,
+                syncHasFields
+                    ? RoundParseStatus.Partial
+                    : RoundParseStatus.Unparsed,
                 response,
                 raw,
-                error: new SafeError(
-                    "not_round_response",
-                    "Response is a Moon Sisters sync/non-round response."));
+                roundId: null,
+                roundIdSource: null,
+                stake: syncStake,
+                payout: null,
+                balance: syncBalance,
+                currency: syncCurrency,
+                error: syncHasFields
+                    ? new SafeError(
+                        "sync_response",
+                        "Response is a Moon Sisters sync/non-round response; " +
+                        "stake and balance recorded, payout and symbols unknown.")
+                    : new SafeError(
+                        "not_round_response",
+                        "Response is a Moon Sisters sync/non-round response."));
         }
 
         var roundId = FindString(root, [
@@ -914,6 +944,7 @@ public sealed class MoonSistersRoundParser : GenericJsonRoundParser
 
 public sealed record RoundAnalysis(
     int Count,
+    int ParsedCount,
     decimal TotalStake,
     decimal TotalPayout,
     decimal? Rtp,
@@ -932,21 +963,36 @@ public static class RoundAnalyzer
 {
     public static RoundAnalysis Analyze(IEnumerable<NormalizedRoundResult> rounds)
     {
-        var valid = rounds.Where(item =>
+        var parsed = rounds.Where(item =>
             item.Status == RoundParseStatus.Parsed &&
-            item.Stake is >= 0 &&
             item.Payout is >= 0).ToArray();
-        var stake = valid.Sum(item => item.Stake!.Value);
-        var payout = valid.Sum(item => item.Payout!.Value);
-        var symbols = valid.SelectMany(item => item.Symbols)
+
+        // All spins that carried a wager (parsed results with a payout, and
+        // sync/partial spins whose stake was recorded) contribute to the RTP
+        // denominator so sync-only spins are not silently dropped.
+        var staked = parsed.Where(item => item.Stake is >= 0)
+            .Concat(rounds.Where(item =>
+                item.Status == RoundParseStatus.Partial &&
+                item.Stake is >= 0));
+
+        var totalStake = staked.Sum(item => item.Stake!.Value);
+        var payout = parsed.Sum(item => item.Payout!.Value);
+        var symbols = parsed.SelectMany(item => item.Symbols)
             .Where(item => item.Symbol is not null)
             .GroupBy(item => item.Symbol!, StringComparer.Ordinal)
             .ToDictionary(group => group.Key, group => group.Count(), StringComparer.Ordinal);
-        var features = valid.Select(item => item.Feature?.Name)
+        var features = parsed.Select(item => item.Feature?.Name)
             .Where(item => !string.IsNullOrWhiteSpace(item))
             .GroupBy(item => item!, StringComparer.Ordinal)
             .ToDictionary(group => group.Key, group => group.Count(), StringComparer.Ordinal);
-        return new(valid.Length, stake, payout, stake == 0 ? null : payout / stake, symbols, features);
+        return new(
+            parsed.Length + rounds.Count(item => item.Status == RoundParseStatus.Partial),
+            parsed.Length,
+            totalStake,
+            payout,
+            totalStake == 0 ? null : payout / totalStake,
+            symbols,
+            features);
     }
 
     public static RoundAnalysisReport AnalyzeJsonl(string path)

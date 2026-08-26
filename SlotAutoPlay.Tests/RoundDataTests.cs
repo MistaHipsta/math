@@ -86,6 +86,77 @@ public sealed class RoundDataTests
     }
 
     [Fact]
+    public void MoonSistersSyncResponseIsPartialWithStakeAndBalance()
+    {
+        var parser = new MoonSistersRoundParser();
+        var request = new RoundParserRequest(
+            "https://betman-demo.head.3oaks.com/betman-demo/gs/moon_sisters/desktop/s/demo/",
+            "POST", "text/plain", "corr-sync");
+        var body = "{\"command\":\"sync\",\"user\":{\"balance\":99860,\"currency\":\"FUN\"},"
+                 + "\"context\":{\"spins\":{\"round_bet\":100}},\"status\":{\"code\":\"OK\"}}";
+        var response = new RoundParserResponse(
+            request.Url, request.Method, 200, "application/json", body,
+            request.CorrelationId, DateTimeOffset.UtcNow);
+
+        // sync/non-play replies are not "play" rounds but still carry a wager:
+        // CanParse is false (only play is a parseable round outcome).
+        Assert.False(parser.CanParse(request, response));
+        // The runtime still routes the body through Parse so the stake/balance
+        // are preserved instead of silently dropped from RTP metrics.
+        var result = parser.Parse(request, response);
+
+        Assert.Equal(RoundParseStatus.Partial, result.Status);
+        Assert.Equal(100m, result.Stake);
+        Assert.Equal(99860m, result.Balance);
+        Assert.Equal("FUN", result.Currency);
+        Assert.Null(result.Payout);
+        Assert.Null(result.RoundId);
+        Assert.Empty(result.Symbols);
+    }
+
+    [Fact]
+    public void MoonSistersNonJsonSyncIsUnparsedWithoutStake()
+    {
+        var parser = new MoonSistersRoundParser();
+        var request = new RoundParserRequest(
+            "https://betman-demo.head.3oaks.com/betman-demo/gs/moon_sisters/desktop/s/demo/",
+            "POST", "text/plain", "corr-non");
+        var response = new RoundParserResponse(
+            request.Url, request.Method, 200, "application/json",
+            "<html>not json</html>", request.CorrelationId, DateTimeOffset.UtcNow);
+
+        var result = parser.Parse(request, response);
+
+        Assert.Equal(RoundParseStatus.Unparsed, result.Status);
+        Assert.Null(result.Stake);
+    }
+
+    [Fact]
+    public void AnalyzerIncludesPartialStakesInRtpDenominator()
+    {
+        var parsed = new NormalizedRoundResult(
+            RoundParseStatus.Parsed, "r-1", "c-1", DateTimeOffset.UtcNow,
+            Stake: 100, Payout: 300, Balance: 990, Currency: "FUN",
+            Symbols: [], WinLines: [], Feature: null,
+            ParserName: "moon-sisters", ParserVersion: "1.0", RawJson: null, Error: null);
+        var sync = new NormalizedRoundResult(
+            RoundParseStatus.Partial, null, "c-2", DateTimeOffset.UtcNow,
+            Stake: 100, Payout: null, Balance: 988, Currency: "FUN",
+            Symbols: [], WinLines: [], Feature: null,
+            ParserName: "moon-sisters", ParserVersion: "1.0", RawJson: null,
+            Error: new SafeError("sync_response", "sync"));
+
+        var analysis = RoundAnalyzer.Analyze(new[] { parsed, sync });
+
+        // Total stake = 200 (both spins), payout = 300 (only the parsed spin).
+        Assert.Equal(2, analysis.Count);
+        Assert.Equal(1, analysis.ParsedCount);
+        Assert.Equal((decimal?)200m, analysis.TotalStake);
+        Assert.Equal((decimal?)300m, analysis.TotalPayout);
+        Assert.Equal((decimal?)1.5m, analysis.Rtp);
+    }
+
+    [Fact]
     public void RedactionRemovesSensitiveKeysRecursively()
     {
         var sanitized = JsonSafety.RedactAndLimitJson(
@@ -316,7 +387,7 @@ public sealed class RoundDataTests
     }
 
     [Fact]
-    public void MoonSistersParserRejectsSyncAsNonRound()
+    public void MoonSistersSyncReplyPreservesStakeAndBalance()
     {
         var request = new RoundParserRequest(
             "https://betman-demo.head.3oaks.com/betman-demo/gs/moon_sisters/desktop/demo/",
@@ -328,18 +399,22 @@ public sealed class RoundDataTests
             request.Method,
             200,
             "application/json",
-            """{"command":"sync","status":{"code":"OK"},"user":{"balance":100,"currency":"FUN"}}""",
+            """{"command":"sync","status":{"code":"OK"},"user":{"balance":100,"currency":"FUN"},"context":{"spins":{"round_bet":100}}}""",
             request.CorrelationId,
             DateTimeOffset.UtcNow);
         var parser = new MoonSistersRoundParser();
 
+        // sync replies are not authoritative round outcomes, but still represent
+        // a wager whose stake and balance must be preserved for RTP accounting.
         Assert.False(parser.CanParse(request, response));
         var result = parser.Parse(request, response);
 
-        Assert.Equal(RoundParseStatus.Unparsed, result.Status);
-        Assert.Null(result.Stake);
+        Assert.Equal(RoundParseStatus.Partial, result.Status);
+        Assert.Equal(100m, result.Stake);
+        Assert.Equal(100m, result.Balance);
+        Assert.Equal("FUN", result.Currency);
         Assert.Null(result.Payout);
-        Assert.Equal("not_round_response", result.Error?.Code);
+        Assert.Equal("sync_response", result.Error?.Code);
     }
 
     [Fact]

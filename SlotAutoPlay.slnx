@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="SlotAutoPlay.Tests/SlotAutoPlay.Tests.csproj" />
+  <Project Path="SlotAutoPlay/SlotAutoPlay.csproj" />
+</Solution>

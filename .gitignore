@@ -1,0 +1,30 @@
+# .NET build artifacts
+[Bb]in/
+[Oo]bj/
+
+# Visual Studio / Rider user files
+.vs/
+.idea/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# Test and coverage results
+TestResults/
+.coverage
+*.coverage
+coverage/
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# Generated runtime output
+output/ 
+# Python cache and local tool artifacts 
+__pycache__/ 
+*.py[cod] 
+tools/*-output.txt 
+tools/python-final.txt 

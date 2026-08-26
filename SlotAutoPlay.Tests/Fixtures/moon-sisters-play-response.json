@@ -1,0 +1,68 @@
+{
+  "command": "play",
+  "context": {
+    "actions": [
+      "spin"
+    ],
+    "current": "spins",
+    "last_action": "spin",
+    "last_args": {
+      "bet_per_line": 4,
+      "lines": 25
+    },
+    "last_win": 160,
+    "round_finished": true,
+    "spins": {
+      "bet_per_line": 4,
+      "board": [
+        [1, 7, 8],
+        [4, 4, 7],
+        [4, 8, 1],
+        [4, 4, 5],
+        [5, 1, 1]
+      ],
+      "bs_v": [
+        [0, 0, 0],
+        [0, 0, 0],
+        [0, 0, 0],
+        [0, 0, 0],
+        [0, 0, 0]
+      ],
+      "bs_values": [
+        [0, 0, 0],
+        [0, 0, 0],
+        [0, 0, 0],
+        [0, 0, 0],
+        [0, 0, 0]
+      ],
+      "lines": 25,
+      "round_bet": 100,
+      "round_win": 0,
+      "total_win": 0
+    },
+    "version": 2
+  },
+  "modes": [
+    "auto",
+    "play"
+  ],
+  "origin_data": {
+    "feature": false,
+    "fullscreen": true,
+    "mobile": "0",
+    "portrait": false,
+    "quickspin": 1,
+    "set_denominator": 1,
+    "sound": true
+  },
+  "status": {
+    "code": "OK"
+  },
+  "user": {
+    "balance": 99660,
+    "balance_version": 10,
+    "currency": "FUN",
+    "is_test": false,
+    "show_balance": true
+  }
+}

@@ -93,6 +93,8 @@ public sealed class PlayConfig
     public int? RoundsOverride { get; init; }
     public int JobsCount { get; init; } = 1;
     public bool RandomizeClickPoint { get; init; }
+    public bool ResponseDriven { get; init; }
+    public bool CollectOnly { get; init; }
     public bool IsDebugMode { get; init; }
     public bool Headless { get; init; } = true;
     public string SpinRequestMarker { get; init; } = "spin";
@@ -111,6 +113,8 @@ public sealed class PlayOptions
 {
     public bool IsDebugMode { get; init; }
     public bool RandomizeClickPoint { get; init; }
+    public bool ResponseDriven { get; init; }
+    public bool CollectOnly { get; init; }
     public bool Headless { get; init; } = true;
     public TimeSpan? DurationOverride { get; init; }
     public int? RoundsOverride { get; init; }

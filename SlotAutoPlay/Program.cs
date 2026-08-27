@@ -22,6 +22,8 @@ internal static class Program
             {
                 IsDebugMode = options.IsDebugMode,
                 RandomizeClickPoint = options.RandomizeClickPoint,
+                ResponseDriven = options.ResponseDriven || options.CollectOnly,
+                CollectOnly = options.CollectOnly,
                 Headless = options.Headless,
                 DurationOverride = duration,
                 RoundsOverride = rounds,
@@ -111,6 +113,8 @@ internal static class Program
         {
             IsDebugMode = HasFlag(args, "--debug"),
             RandomizeClickPoint = HasFlag(args, "--random-click"),
+            ResponseDriven = HasFlag(args, "--response-driven"),
+            CollectOnly = HasFlag(args, "--collect-only"),
             Headless = !HasFlag(args, "--headed"),
             CaptureRoundData = HasFlag(args, "--capture-round-data"),
             DiagnosticNetwork = HasFlag(args, "--diagnostic-network")
@@ -326,6 +330,13 @@ internal static class Program
 
     private static void Validate(PlayConfig config)
     {
+        if ((config.ResponseDriven || config.CollectOnly) &&
+            !config.CaptureRoundData)
+        {
+            throw new ArgumentException(
+                "--response-driven/--collect-only requires --capture-round-data.");
+        }
+
         if (config.JobsCount <= 0)
         {
             throw new ArgumentOutOfRangeException(

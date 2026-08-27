@@ -93,9 +93,42 @@ public sealed class SlotSessionRunner
         while (!cancellationToken.IsCancellationRequested &&
                Stopwatch.GetElapsedTime(startedAt) < config.SessionMaxDuration)
         {
+            if (config.CollectOnly)
+            {
+                var collected = await RunCollectOnlyClickAsync(
+                    automation,
+                    cancellationToken).ConfigureAwait(false);
+
+                if (!collected)
+                {
+                    Console.WriteLine(
+                        $"[{sessionId}] Collect-only spin did not receive HTTP 200; " +
+                        "restarting session.");
+                    break;
+                }
+
+                if (TryCountCollectedRound())
+                {
+                    Console.WriteLine(
+                        $"[{sessionId}] Collected round limit reached: " +
+                        $"{config.RoundsOverride}.");
+                    return true;
+                }
+
+                continue;
+            }
+
             var result = await RunOrIdleClickAsync(
                 automation,
                 cancellationToken).ConfigureAwait(false);
+
+            if (config.ResponseDriven && result is null)
+            {
+                Console.WriteLine(
+                    $"[{sessionId}] Response-driven spin did not produce a result; " +
+                    "restarting session.");
+                break;
+            }
 
             if (result?.Status == RoundParseStatus.Parsed &&
                 TryCountParsedRound())
@@ -120,12 +153,33 @@ public sealed class SlotSessionRunner
         return false;
     }
 
+    private async Task<bool> RunCollectOnlyClickAsync(
+        HttpBrowserAutomation automation,
+        CancellationToken cancellationToken)
+    {
+        await automation.ClickAsync(
+            config.SpinButton,
+            "spin",
+            cancellationToken).ConfigureAwait(false);
+
+        // Collection is deliberately time-driven: network responses are captured
+        // by Playwright listeners and must not gate the next click.
+        await Task.Delay(
+            TimeSpan.FromMilliseconds(800),
+            cancellationToken).ConfigureAwait(false);
+
+        return true;
+    }
+
     public async Task<NormalizedRoundResult?> RunOrIdleClickAsync(
         HttpBrowserAutomation automation,
         CancellationToken cancellationToken)
     {
-        await Task.Delay(config.IdleDuration, cancellationToken)
-            .ConfigureAwait(false);
+        if (!config.ResponseDriven)
+        {
+            await Task.Delay(config.IdleDuration, cancellationToken)
+                .ConfigureAwait(false);
+        }
 
         await automation.ClickAsync(
             config.SpinButton,
@@ -139,8 +193,11 @@ public sealed class SlotSessionRunner
                 .ConfigureAwait(false);
         }
 
-        await RunOrIdleClickDelayAsync(automation, cancellationToken)
-            .ConfigureAwait(false);
+        if (!config.ResponseDriven)
+        {
+            await RunOrIdleClickDelayAsync(automation, cancellationToken)
+                .ConfigureAwait(false);
+        }
 
         return result;
     }
@@ -156,6 +213,33 @@ public sealed class SlotSessionRunner
             config.SpinButton,
             "check",
             cancellationToken).ConfigureAwait(false);
+    }
+
+    private bool TryCountCollectedRound()
+    {
+        if (config.RoundsOverride is not { } limit)
+        {
+            return false;
+        }
+
+        while (true)
+        {
+            var current = Volatile.Read(ref parsedRoundCount);
+            if (current >= limit)
+            {
+                return false;
+            }
+
+            if (Interlocked.CompareExchange(
+                    ref parsedRoundCount,
+                    current + 1,
+                    current) == current)
+            {
+                var newCount = current + 1;
+                TryReportProgress(newCount, limit);
+                return newCount == limit;
+            }
+        }
     }
 
     private bool TryCountParsedRound()

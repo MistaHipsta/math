@@ -77,7 +77,16 @@ dotnet run --project .\SlotAutoPlay -- --jobs 3 --random-click --headed
   кодом;
 - `--debug` — только открытие и `OpenPageClicks`;
 - `--headed` — показать браузер; default — headless;
-- `--random-click` — случайная точка внутри прямоугольника; default — центр.
+- `--random-click` — случайная точка внутри прямоугольника; default — центр;
+- `--response-driven` — после spin ждать authoritative response и сразу запускать
+  следующий spin без `IdleDuration`, `CheckClick` и второго `check`-клика.
+  Требует `--capture-round-data`. Используйте только после проверки, что игра
+  разрешает следующий spin без закрытия UI-оверлея или отдельного check-действия;
+- `--collect-only` — режим быстрого сбора: выполняет Spin click, ждёт
+  authoritative HTTP response со статусом `200`, сразу разрешает следующий Spin
+  click и не запускает parser. Сырой JSON response всё равно дочитывается и
+  сохраняется в JSONL в фоновой задаче. Требует `--capture-round-data`; для
+  остановки используйте `--duration-seconds` или `Ctrl+C`.
 
 Остановка выполняется через `Ctrl+C`. После штатного или ошибочного завершения
 сессии worker автоматически создаёт новую. Ошибка одного worker-а не завершает
@@ -228,6 +237,26 @@ dotnet run --project .\SlotAutoPlay -- `
 
 Не используйте один только substring `spin` как доказательство endpoint.
 
+### Быстрый raw-сбор без нормализации
+
+Для сбора response без блокировки на математическом parser-е:
+
+```powershell
+dotnet run --project .\SlotAutoPlay -- `
+  --game moon-sisters --headed --jobs 1 `
+  --capture-round-data --collect-only --duration-seconds 60
+```
+
+В этом режиме следующий Spin click выполняется только после получения
+authoritative `HTTP 200`. Поля `RawJson`, статус и correlation ID сохраняются
+в JSONL; ошибки parser-а не останавливают сбор. После завершения сессии
+обрабатывайте JSONL отдельным анализатором, например:
+
+```powershell
+python .\tools\analyze_moon_jsonl.py `
+  .\output\slotautoplay\moon-sisters\<session>.jsonl
+```
+
 ### Mapping и включение capture
 
 После получения обезличенного fixture добавьте в
@@ -287,6 +316,21 @@ dotnet run --project .\SlotAutoPlay -- `
   --capture-round-data --max-response-bytes 1048576 `
   --duration-seconds 30
 ```
+
+Для response-driven запуска, если smoke-проверка подтвердила, что отдельный
+check-клик не нужен:
+
+```powershell
+dotnet run --project .\SlotAutoPlay -- `
+  --game moon-sisters --headed --jobs 1 `
+  --capture-round-data --response-driven `
+  --duration-seconds 30
+```
+
+В этом режиме приложение кликает spin, ждёт authoritative response, а затем
+сразу кликает следующий spin. `round_timeout` или ошибка чтения response
+останавливает текущую сессию и вызывает её обычный restart; следующий spin после
+неподтверждённого ответа не выполняется.
 
 Параметры `--capture-round-data`, `--diagnostic-network`,
 `--max-response-bytes N` (1024..16777216, default 1 MiB) не изменяют прежние

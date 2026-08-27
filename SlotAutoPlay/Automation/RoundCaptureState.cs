@@ -20,6 +20,7 @@ public sealed class RoundCaptureState
     private MatchedRequest? matchedRequest;
     private TaskCompletionSource<MatchedRequest?>? completion;
     private TaskCompletionSource<RoundResponseRecord?>? responseCompletion;
+    private TaskCompletionSource<int>? responseStatusCompletion;
 
     public string? CurrentCorrelationId
     {
@@ -70,6 +71,8 @@ public sealed class RoundCaptureState
             completion = new TaskCompletionSource<MatchedRequest?>(
                 TaskCreationOptions.RunContinuationsAsynchronously);
             responseCompletion = new TaskCompletionSource<RoundResponseRecord?>(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+            responseStatusCompletion = new TaskCompletionSource<int>(
                 TaskCreationOptions.RunContinuationsAsynchronously);
             return pending;
         }
@@ -123,6 +126,43 @@ public sealed class RoundCaptureState
         }
     }
 
+    public bool TryCompleteResponseStatus(int status)
+    {
+        lock (gate)
+        {
+            return pending is not null &&
+                   responseStatusCompletion is not null &&
+                   responseStatusCompletion.TrySetResult(status);
+        }
+    }
+
+    public async Task<int?> WaitForResponseStatusAsync(
+        TimeSpan timeout,
+        CancellationToken cancellationToken)
+    {
+        Task<int> task;
+        lock (gate)
+        {
+            if (pending is null || responseStatusCompletion is null)
+            {
+                return null;
+            }
+
+            task = responseStatusCompletion.Task;
+        }
+
+        try
+        {
+            return await task.WaitAsync(timeout, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (TimeoutException)
+        {
+            Complete();
+            return null;
+        }
+    }
+
     public async Task<MatchedRequest?> WaitForRequestAsync(
         TimeSpan timeout,
         CancellationToken cancellationToken)
@@ -165,6 +205,7 @@ public sealed class RoundCaptureState
             completion?.TrySetResult(null);
             completion = null;
             responseCompletion = null;
+            responseStatusCompletion = null;
         }
     }
 

@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using Microsoft.Playwright;
 using SlotAutoPlay.Infrastructure;
 using SlotAutoPlay.Models;
@@ -18,6 +19,7 @@ public sealed class HttpBrowserAutomation : IAsyncDisposable
     private readonly List<Task> pendingLogTasks = [];
     private readonly RoundCaptureState captureState = new();
     private readonly Dictionary<IRequest, MatchedRequest> matchedRequests = [];
+    private readonly ConcurrentQueue<PendingSpin> collectOnlySpins = new();
     private bool acceptingRequests = true;
     private bool disposed;
     private DateTimeOffset? lastNetworkActivity;
@@ -246,7 +248,17 @@ public sealed class HttpBrowserAutomation : IAsyncDisposable
         PendingSpin? spin = null;
         if (isSpin && (config.CaptureRoundData || config.DiagnosticNetwork))
         {
-            spin = captureState.BeginSpin();
+            spin = config.CollectOnly
+                ? new PendingSpin(
+                    Guid.NewGuid().ToString("N"),
+                    DateTimeOffset.UtcNow)
+                : captureState.BeginSpin();
+
+            if (config.CollectOnly)
+            {
+                collectOnlySpins.Enqueue(spin);
+            }
+
             await LogEventAsync("spin_click", new
             {
                 sessionId,
@@ -280,6 +292,50 @@ public sealed class HttpBrowserAutomation : IAsyncDisposable
 
             throw;
         }
+    }
+
+    public async Task<bool> WaitForSuccessfulResponseAsync(
+        CancellationToken cancellationToken)
+    {
+        if (!captureState.HasPending)
+        {
+            return false;
+        }
+
+        var request = await captureState.WaitForRequestAsync(
+            config.LastResponseTimeout,
+            cancellationToken).ConfigureAwait(false);
+
+        if (request is null)
+        {
+            await LogEventAsync("round_timeout", new
+            {
+                sessionId,
+                correlationId = captureState.LastCompletedCorrelationId,
+                reason = "request_not_found"
+            }).ConfigureAwait(false);
+            return false;
+        }
+
+        var status = await captureState.WaitForResponseStatusAsync(
+            config.LastResponseTimeout,
+            cancellationToken).ConfigureAwait(false);
+
+        var success = status == 200;
+        if (!success)
+        {
+            await LogEventAsync("round_timeout", new
+            {
+                sessionId,
+                correlationId = request.Spin.CorrelationId,
+                reason = status is null
+                    ? "response_status_timeout"
+                    : $"http_status_{status}"
+            }).ConfigureAwait(false);
+        }
+
+        captureState.Complete();
+        return success;
     }
 
     public async Task<NormalizedRoundResult?> WaitForSpinAsync(
@@ -434,6 +490,51 @@ public sealed class HttpBrowserAutomation : IAsyncDisposable
             return;
         }
 
+        if (config.CollectOnly && authoritative)
+        {
+            if (!collectOnlySpins.TryDequeue(out var collectSpin))
+            {
+                collectSpin = new PendingSpin(
+                    Guid.NewGuid().ToString("N"),
+                    DateTimeOffset.UtcNow);
+            }
+
+            var collectUrl = JsonSafety.SanitizeUrl(request.Url);
+            var collectContentType = Header(request.Headers, "content-type");
+            var collectMatched = new MatchedRequest(
+                collectSpin,
+                collectUrl,
+                request.Method,
+                collectContentType,
+                DateTimeOffset.UtcNow,
+                IsAuthoritative: true);
+
+            lock (stateGate)
+            {
+                matchedRequests[request] = collectMatched;
+            }
+
+            var collectRequestRecord = new RoundRequestRecord(
+                collectMatched.TimestampUtc,
+                collectMatched.Spin.CorrelationId,
+                collectUrl,
+                request.Method,
+                collectContentType,
+                null,
+                null);
+
+            TrackTask(LogEventAsync(
+                "round_request",
+                new
+                {
+                    sessionId,
+                    correlationId = collectMatched.Spin.CorrelationId,
+                    request = collectRequestRecord
+                }));
+
+            return;
+        }
+
         if (!captureState.HasPending)
         {
             return;
@@ -500,7 +601,14 @@ public sealed class HttpBrowserAutomation : IAsyncDisposable
             }
         }
 
-        TrackTask(HandleResponseAsync(response, matched));
+        var responseTask = HandleResponseAsync(response, matched);
+
+        if (matched.IsAuthoritative && response.Status == 200)
+        {
+            captureState.TryCompleteResponseStatus(response.Status);
+        }
+
+        TrackTask(responseTask);
     }
 
     private async Task HandleResponseAsync(

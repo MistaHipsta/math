@@ -85,6 +85,8 @@ public abstract class GameConfigProvider
             JobsCount = jobsCount,
             IsDebugMode = options.IsDebugMode,
             RandomizeClickPoint = options.RandomizeClickPoint,
+            ResponseDriven = options.ResponseDriven,
+            CollectOnly = options.CollectOnly,
             Headless = options.Headless
         };
     }

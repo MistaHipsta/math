@@ -1,5 +1,9 @@
 # SlotAutoPlay
 
+> **Быстрый сбор без браузера:** для Moon Sisters есть HTTP-коллектор,
+> который собирает раунды напрямую через API игры примерно в 80 раз быстрее
+> браузерной автоматизации. См. [`tools/README.md`](../tools/README.md).
+
 .NET 8 console application для автоматизации browser-сессий через
 Microsoft.Playwright. Каждая сессия получает отдельные `BrowserContext` и
 `Page` с фиксированным viewport.

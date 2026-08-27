@@ -714,6 +714,13 @@ def main(argv: list[str] | None = None) -> int:
         f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{run_id}"
     )
     run_dir = args.out_root / run_name
+    if run_dir.exists() and any(run_dir.glob("MoonSisters-worker-*.jsonl")):
+        # Reusing a run name would silently mix two collections in one folder
+        # and inflate every downstream count.
+        raise SystemExit(
+            f"{run_dir} already holds a collected run; "
+            "choose another --run-name or remove the folder."
+        )
     run_dir.mkdir(parents=True, exist_ok=True)
 
     print(

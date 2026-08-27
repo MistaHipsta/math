@@ -566,9 +566,10 @@ def run_worker(
                 stats["rejected"] = stats.get("rejected", 0) + 1
                 stats[f"reason_{reason}"] = stats.get(f"reason_{reason}", 0) + 1
 
-                if reason in SESSION_LOST and stats["logins"] <= args.max_logins:
-                    # The session was invalidated; open a new one and retry
-                    # instead of burning the failure budget.
+                if args.max_logins <= 0 or stats["logins"] <= args.max_logins:
+                    # Any rejected spin (lost session, drained demo balance,
+                    # server error) is recovered by opening a new session on
+                    # this same worker instead of burning the failure budget.
                     try:
                         opened = open_session(
                             url, session["token"], headers, args.timeout
@@ -597,6 +598,25 @@ def run_worker(
 
             stats["ok"] += 1
             reporter.tick(budget.complete())
+
+            # The demo wallet is finite, so refresh the session before it runs
+            # dry instead of waiting for the backend to start rejecting spins.
+            balance = (json.loads(raw).get("user") or {}).get("balance")
+            stake = args.bet_per_line * args.lines
+            if balance is not None and balance < stake * args.min_balance_spins:
+                try:
+                    opened = open_session(
+                        url, session["token"], headers, args.timeout
+                    )
+                    session_id = opened["session_id"]
+                    stats["logins"] += 1
+                    stats["balance_refresh"] = stats.get("balance_refresh", 0) + 1
+                except Exception as error:  # noqa: BLE001
+                    print(
+                        f"[worker-{worker:02d}] balance re-login failed: {error}",
+                        flush=True,
+                    )
+
             if args.delay > 0:
                 time.sleep(args.delay)
 
@@ -645,10 +665,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument("--workers", type=int, default=10)
     parser.add_argument(
+        "--min-balance-spins",
+        type=int,
+        default=20,
+        help="Re-open the session when fewer than N spins remain affordable",
+    )
+    parser.add_argument(
         "--max-logins",
         type=int,
-        default=50,
-        help="Maximum session re-opens per worker before giving up",
+        default=0,
+        help="Maximum session re-opens per worker; 0 means unlimited",
     )
     parser.add_argument("--rounds", type=int, default=10000)
     parser.add_argument("--bet-per-line", type=int, default=4)

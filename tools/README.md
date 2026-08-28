@@ -143,20 +143,62 @@ output/http-runs/<run-name>/
 В `run.json` — сводка прогона: собрано раундов, отказы, скорость и
 статистика по каждому воркеру. Session material редактируется.
 
-## 3. Конвертация в нормализованный формат
+## 3. Конвертация в MathArtifact books
+
+По умолчанию конвертер создаёт
+`output/http-runs/<run>/artifact-books.jsonl`. Каждая непустая строка — одна
+компактная JSON-книга без внешней обёртки:
+
+```json
+{"board":[[1,7,8],[4,4,7]],"winLines":[{"id":"7","amount":25,"positions":[[0,1],[2,0]],"symbol":"Ж"}],"payout":25}
+```
+
+Ключи книги всегда идут в порядке `board`, `winLines`, `payout`. `board` —
+исходный `list[list[int]]`; `winLines` содержит только `id`, `amount`,
+`positions` и `symbol`, где позиция имеет вид `[reel,row]`; `payout` — только
+целое число `>= 0`. JSON сериализуется компактно, с UTF-8 без экранирования
+Unicode. `stake` используется как обязательная проверка исходного раунда, но
+в книгу не записывается. Поле `weight` не добавляется (для обычного раунда
+эффективный вес равен `1`).
 
 ```powershell
 python .\tools\convert_moon_raw_to_round_results.py `
   --root .\output\http-runs\run-10000 `
-  --workers 10 `
+  --workers 10
+```
+
+Опции `--output` и `--format` остаются совместимыми с прежним сценарием:
+
+```powershell
+python .\tools\convert_moon_raw_to_round_results.py `
+  --root .\output\http-runs\run-10000 `
+  --format round_result `
   --output .\output\http-runs\run-10000\round-results.jsonl
 ```
 
-Конвертер раскладывает `context.spins.board` в массив символов с
-координатами `Reel`, `Row`, `Column`, `Index` и берёт выплату из
-`round_win` → `total_win` → `last_win`.
+`--format artifact_book` (по умолчанию) пишет книги, а
+`--format round_result` пишет прежний контейнер `round_result`, который
+используется существующим анализатором. В artifact-режиме строки размером
+более **96 000 байт в UTF-8** пропускаются и учитываются в счётчике
+`oversized`. Malformed JSON, не-`play` события и записи без `board`, `stake`
+или выплаты также пропускаются. CSV для artifact-книг не создаётся.
 
-## 4. Анализ и отчёт
+Минимальный C# streaming adapter читает книгу построчно, не загружая весь
+JSONL в память:
+
+```csharp
+await foreach (var line in File.ReadLinesAsync(path))
+{
+    using var document = JsonDocument.Parse(line);
+    var root = document.RootElement;
+    var board = root.GetProperty("board");
+    var payout = root.GetProperty("payout").GetInt32();
+    var winLines = root.GetProperty("winLines");
+    ConsumeBook(board, winLines, payout);
+}
+```
+
+Для анализа используйте legacy-выход:
 
 ```powershell
 python .\tools\analyze_moon_jsonl.py `
@@ -165,9 +207,12 @@ python .\tools\analyze_moon_jsonl.py `
   --csv .\output\http-runs\run-10000\rounds.csv
 ```
 
-В `analysis.json` попадают агрегаты (`total_stake`, `total_payout`, `rtp`,
-статистика символов) и массив `rounds`, где у каждого раунда есть `stake`,
-`payout` и `symbols` с расположением на гриде.
+Анализатор намеренно сохраняет поддержку legacy `round_result`; для
+агрегации книг конвертируйте тот же исходный сбор с
+`--format round_result`. В `analysis.json` попадают агрегаты
+(`total_stake`, `total_payout`, `rtp`, статистика символов) и массив `rounds`,
+где у каждого раунда есть `stake`, `payout` и `symbols` с расположением на
+гриде.
 
 Для очень больших прогонов не используйте `--json`: анализатор держит все
 раунды в памяти и включает их в отчёт. На 3 млн записей это потребует
@@ -203,7 +248,8 @@ python .\tools\inspect_wins.py .\output\http-runs\run-10000
 $run = "run-10000"
 python .\tools\collect_moon_http.py --url "<play-url>" --token "<token>" --workers 10 --rounds 10000 --progress-every 1000 --run-name $run
 python .\tools\inspect_run.py .\output\http-runs\$run
-python .\tools\convert_moon_raw_to_round_results.py --root .\output\http-runs\$run --workers 10 --output .\output\http-runs\$run\round-results.jsonl
+python .\tools\convert_moon_raw_to_round_results.py --root .\output\http-runs\$run --workers 10
+python .\tools\convert_moon_raw_to_round_results.py --root .\output\http-runs\$run --workers 10 --format round_result --output .\output\http-runs\$run\round-results.jsonl
 python .\tools\analyze_moon_jsonl.py .\output\http-runs\$run\round-results.jsonl --json .\output\http-runs\$run\analysis.json
 ```
 

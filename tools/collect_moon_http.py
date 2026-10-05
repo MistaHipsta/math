@@ -21,6 +21,7 @@ is supplied per run via CLI or a sessions file and is redacted in logs.
 from __future__ import annotations
 
 import argparse
+import copy
 import gzip
 import json
 import random
@@ -482,6 +483,7 @@ def run_worker(
             # backend marks it finished, otherwise the bonus win is lost and
             # the unfinished round poisons the session.
             bonus_steps = 0
+            play_history: list[dict[str, Any]] = []
             if reason is None:
                 spin_board = (
                     (json.loads(raw).get("context") or {})
@@ -489,6 +491,7 @@ def run_worker(
                     .get("board")
                 )
                 context = json.loads(raw).get("context") or {}
+                play_history.append(copy.deepcopy(context))
 
                 while (
                     context.get("round_finished") is False
@@ -521,6 +524,7 @@ def run_worker(
                         reason = f"bonus_http_{status}"
                         break
                     context = json.loads(raw).get("context") or {}
+                    play_history.append(copy.deepcopy(context))
 
                 if context.get("round_finished") is False and reason is None:
                     reason = "round_unfinished"
@@ -556,6 +560,7 @@ def run_worker(
                     "ContentType": content_type,
                     "BodyBytes": len(raw.encode("utf-8")),
                     "RawJson": raw[: args.max_response_bytes],
+                    "playHistory": play_history,
                     "Error": None if reason is None else {"code": reason},
                 },
             }
@@ -700,6 +705,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Parent folder; each run gets its own timestamped subfolder",
     )
     parser.add_argument("--run-name", help="Override the run folder name")
+    parser.add_argument(
+        "--raw-only",
+        action="store_true",
+        help="Collect raw responses without building the Stake and Artube artifacts",
+    )
     return parser.parse_args(argv)
 
 
@@ -707,6 +717,14 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv if argv is not None else sys.argv[1:])
     if args.workers < 1 or args.rounds < 1:
         raise SystemExit("--workers and --rounds must be positive.")
+    if not args.raw_only:
+        try:
+            import zstandard  # noqa: F401
+        except ImportError as error:
+            raise SystemExit(
+                "Artifact export needs zstandard. Install it before collection: "
+                "python -m pip install -r tools/requirements-artifacts.txt"
+            ) from error
 
     sessions = load_sessions(args)
     run_id = uuid.uuid4().hex[:12]
@@ -798,7 +816,21 @@ def main(argv: list[str] | None = None) -> int:
     print(f"collected={budget.done} failed={budget.failed}")
     print(f"elapsed={elapsed:.1f}s")
     print(f"run_dir={run_dir}")
-    return 0 if budget.done > 0 else 1
+    if budget.done <= 0:
+        return 1
+    if not args.raw_only:
+        try:
+            from build_moon_artifacts import convert
+
+            report = convert(run_dir, args.workers)
+            print("artifacts=" + json.dumps(report, ensure_ascii=False))
+            print(f"stake_artifact={run_dir / 'converted-artifact' / 'stake'}")
+            print(f"artube_artifact={run_dir / 'converted-artifact' / 'artube'}")
+        except Exception as error:  # noqa: BLE001
+            print(f"artifact export failed: {type(error).__name__}: {error}", file=sys.stderr)
+            print("Raw collection is preserved; rerun build_moon_artifacts.py after fixing the issue.", file=sys.stderr)
+            return 1
+    return 0
 
 
 if __name__ == "__main__":

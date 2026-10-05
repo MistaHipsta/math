@@ -1,5 +1,65 @@
 # Moon Sisters HTTP collector
 
+## Stake и Artube выходы
+
+Обычный запуск `collect_moon_http.py` теперь сохраняет каждый ответ бонусного
+раунда в `response.playHistory` и по завершении строит два самостоятельных
+артефакта:
+
+```text
+<run>/converted-artifact/stake/
+  index.json
+  books_base.jsonl.zst
+  lookUpTable_base_0.csv
+  manifest.json
+<run>/converted-artifact/artube/
+  index.json
+  books_base.jsonl.zst
+  lookUpTable_base_0.csv
+  manifest.json
+<run>/converted-artifact/audit-report.json
+```
+
+Перед первым полным запуском установите единственную зависимость конвертации:
+
+```powershell
+python -m pip install -r .\tools\requirements-artifacts.txt
+```
+
+Затем запускайте сбор как обычно:
+
+```powershell
+python .\tools\collect_moon_http.py `
+  --url "<play-url>" `
+  --token "<demo-token>" `
+  --workers 10 `
+  --rounds 3000000 `
+  --run-name mooncoin-3m
+```
+
+Конвертация начинается после записи `run.json`, принимает только завершённые
+раунды и сверяет число книг с `roundsCollected`. CSV содержит `id,1,payout`
+для каждой книги в исходных целочисленных кредитах. Оба каталога используют
+одинаковый `index.json` с одной базовой игрой; различаются их `events`:
+Stake хранит стандартную запись раунда и состояния всех шагов, Artube —
+Mooncoin payload с базовым полем, линиями, матрицами монет и историей действий.
+Выплата в книге остаётся целым числом игровых кредитов, не суммой валюты GBR.
+
+Если нужно только собрать RAW для другого анализа, укажите `--raw-only`.
+Чтобы отдельно перестроить оба каталога для уже собранного запуска:
+
+```powershell
+python .\tools\build_moon_artifacts.py `
+  --root .\output\http-runs\mooncoin-3m `
+  --workers 10
+```
+
+Скрипт не заменяет непустые каталоги артефактов. Выходные папки будут созданы
+целиком после сверки строк, CSV и суммы выплат. У старых сборов, где
+`playHistory` отсутствует, бонус помечается как неполный; выдуманных состояний
+респинов конвертер не создаёт. Для таких RAW скрипт всё равно может сформировать
+две папки, но `manifest.json` обозначит неполную бонусную историю.
+
 Сбор математики раундов напрямую через HTTP-API игры, без браузера и
 Playwright. Каждый воркер открывает собственную игровую сессию, крутит спины
 и доигрывает бонусные раунды до конца.
@@ -248,10 +308,12 @@ python .\tools\inspect_wins.py .\output\http-runs\run-10000
 $run = "run-10000"
 python .\tools\collect_moon_http.py --url "<play-url>" --token "<token>" --workers 10 --rounds 10000 --progress-every 1000 --run-name $run
 python .\tools\inspect_run.py .\output\http-runs\$run
-python .\tools\convert_moon_raw_to_round_results.py --root .\output\http-runs\$run --workers 10
 python .\tools\convert_moon_raw_to_round_results.py --root .\output\http-runs\$run --workers 10 --format round_result --output .\output\http-runs\$run\round-results.jsonl
 python .\tools\analyze_moon_jsonl.py .\output\http-runs\$run\round-results.jsonl --json .\output\http-runs\$run\analysis.json
 ```
+
+При штатном запуске первый шаг уже создаёт оба игровых артефакта. Следующая
+строка здесь строит только отдельный legacy-файл для анализатора.
 
 ## Известные ограничения
 

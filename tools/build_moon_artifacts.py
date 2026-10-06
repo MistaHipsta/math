@@ -29,9 +29,48 @@ def iter_rounds(root: Path, workers: int) -> Iterator[tuple[Path, dict[str, Any]
             for line_no, line in enumerate(stream, 1):
                 if not line.strip():
                     continue
+                if not line.endswith("\n"):
+                    # A collector killed mid-write leaves a cut last line; it
+                    # is not a finished round and is never counted as one.
+                    break
                 event = json.loads(line)
                 if event.get("type") == "round_response":
                     yield candidates[0], event
+
+
+def incomplete_round(event: dict[str, Any]) -> str | None:
+    """Why a round must stay out of the artifacts, or None if it is complete.
+
+    A bonus counts only with its whole chain: the spin that triggered it,
+    every following action the backend offered, in order, and a finished
+    last step after the respin counter ran out. Rounds without step history
+    are judged by the final response alone (`build_book` checks that).
+    """
+    history = (event.get("response") or {}).get("playHistory")
+    if not isinstance(history, list) or not history:
+        return None
+    first, last = history[0], history[-1]
+    if first.get("last_action", "spin") != "spin":
+        return "history does not start with the spin"
+    if last.get("round_finished") is not True:
+        return "last step is not finished"
+    for step, context in enumerate(history[:-1]):
+        if context.get("round_finished") is not False:
+            return f"step {step} finished before the end of the round"
+        offered = context.get("actions") or []
+        played = history[step + 1].get("last_action")
+        if not offered or played != offered[0]:
+            return f"step {step + 1} played {played!r}, backend offered {offered[:1]}"
+    bonus_steps = [c for c in history if c.get("current") == "bonus"
+                   and isinstance(c.get("bonus"), dict)]
+    if bonus_steps and bonus_steps[-1]["bonus"].get("rounds_left") not in (0, None):
+        return "bonus ended with respins left"
+    try:
+        recorded = json.loads(event["response"]["RawJson"])["context"]["spins"].get("bonus_steps", 0)
+    except (KeyError, TypeError, ValueError):
+        return "final response is unreadable"
+    if recorded != len(history) - 1:
+        return f"bonus_steps {recorded} does not match {len(history) - 1} recorded steps"
 
 
 def is_matrix(value: Any) -> bool:
@@ -76,7 +115,11 @@ def build_book(event: dict[str, Any], expected_id: int,
     bonus = bool(spins.get("bonus_steps", 0)) or len(history) > 1
     artifact_events = []
     for step, context in enumerate(history):
-        state = context.get("spins") or {}
+        # During the respin bonus the live board, coins and respin counter are
+        # in `context.bonus`; `context.spins` keeps the trigger board frozen.
+        bonus_state = context.get("bonus")
+        in_bonus = context.get("current") == "bonus" and isinstance(bonus_state, dict)
+        state = bonus_state if in_bonus else (context.get("spins") or {})
         current_board = state.get("board")
         if not is_matrix(current_board) or any(type(n) is not int or n not in SYMBOL_IDS for col in current_board for n in col):
             raise ValueError(f"invalid board at playHistory step {step}")
@@ -101,12 +144,18 @@ def build_book(event: dict[str, Any], expected_id: int,
         win_lines = state.get("winlines", [])
         if not isinstance(win_lines, list):
             raise ValueError("winlines must be an array")
-        artifact_events.append({"action": action, "board": current_board,
-                                "winLines": win_lines, "coinValues": values,
-                                "coinAmounts": amounts,
-                                "roundWin": state.get("round_win", 0),
-                                "totalWin": state.get("total_win", 0),
-                                "roundFinished": context.get("round_finished")})
+        event = {"action": action, "board": current_board,
+                 "winLines": win_lines, "coinValues": values,
+                 "coinAmounts": amounts,
+                 "roundWin": state.get("round_win", 0),
+                 "totalWin": state.get("total_win", 0),
+                 "roundFinished": context.get("round_finished")}
+        if in_bonus:
+            event.update({"phase": "bonus",
+                          "respinsLeft": state.get("rounds_left"),
+                          "coinCount": state.get("bs_count"),
+                          "newCoins": state.get("new_bs", [])})
+        artifact_events.append(event)
 
     base_win_lines = artifact_events[0]["winLines"]
     history_complete = history_available or not bonus
@@ -173,6 +222,7 @@ def convert(root: Path, workers: int) -> dict[str, Any]:
     outputs: dict[str, Any] = {}
     compressor = zstd.ZstdCompressor(level=3)
     summary = {"rounds": 0, "bonusRounds": 0, "incompleteLegacyBonusRounds": 0,
+               "rejectedIncompleteRounds": 0, "rejectedReasons": {},
                "stakePayoutTotal": 0, "artubePayoutTotal": 0,
                "lookupRows": 0,
                "betCredits": expected_bet,
@@ -187,7 +237,15 @@ def convert(root: Path, workers: int) -> dict[str, Any]:
         csv_tmp = temporary / "weights.csv"
         with csv_tmp.open("w", encoding="utf-8", newline="") as weight_file:
             weights = csv.writer(weight_file, lineterminator="\n")
-            for index, (_, event) in enumerate(iter_rounds(root, workers), 1):
+            index = 0
+            for _, event in iter_rounds(root, workers):
+                problem = incomplete_round(event)
+                if problem is not None:
+                    summary["rejectedIncompleteRounds"] += 1
+                    reasons = summary["rejectedReasons"]
+                    reasons[problem] = reasons.get(problem, 0) + 1
+                    continue
+                index += 1
                 record, payout, bonus = build_book(event, index, expected_bet)
                 write_line(outputs["stake"], record["stake"])
                 write_line(outputs["artube"], record["artube"])
@@ -201,8 +259,9 @@ def convert(root: Path, workers: int) -> dict[str, Any]:
                 summary["maxPayout"] = max(summary["maxPayout"], payout)
         stack.close()
         outputs.clear()
-        if summary["rounds"] != expected_count:
-            raise ValueError(f"run.json says {expected_count} rounds, but converted {summary['rounds']}")
+        seen = summary["rounds"] + summary["rejectedIncompleteRounds"]
+        if seen != expected_count:
+            raise ValueError(f"run.json says {expected_count} rounds, but found {seen}")
         summary["totalStake"] = summary["rounds"] * summary["betCredits"]
         summary["lookupRows"] = summary["rounds"]
         summary["rtp"] = summary["stakePayoutTotal"] / summary["totalStake"] if summary["totalStake"] else None

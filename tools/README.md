@@ -17,16 +17,31 @@ python -m playwright install chromium
 # один IP (свой), медленно
 python .\tools\collect_moon_browser.py --workers 10 --rounds 10000 --rate 1
 
-# через бесплатные прокси proxifly, свой IP к игре не обращается
-python .\tools\collect_moon_browser.py --proxies proxifly --workers 20 --rounds 10000 --rate 0.5
+# через все бесплатные списки прокси, свой IP к игре не обращается
+python .\tools\collect_moon_browser.py --proxies all --workers 50 --rounds 10000 --rate 0.5
 ```
 
 ### Прокси
 
-`--proxies` принимает `proxifly` (бесплатный список
-[proxifly/free-proxy-list](https://github.com/proxifly/free-proxy-list)), путь к
-файлу или URL. Формат: JSON proxifly, JSON-массив строк или текст по строке на
-прокси (`socks5://host:port`, `http://host:port`, `host:port`).
+`--proxies` принимает через запятую встроенные списки, пути к файлам и URL.
+Все источники сливаются в один пул, один и тот же `host:port` из разных списков
+проверяется один раз. Если один список не скачался, остальные работают.
+
+| Имя | Источник |
+| --- | --- |
+| `proxifly` | [proxifly/free-proxy-list](https://github.com/proxifly/free-proxy-list) |
+| `proxyscrape` | [ProxyScrape/free-proxy-list](https://github.com/ProxyScrape/free-proxy-list) |
+| `proxio` | [proxio-io/proxy-list](https://github.com/proxio-io/proxy-list) (http, https, socks4, socks5) |
+| `monosans` | [monosans/proxy-list](https://github.com/monosans/proxy-list) |
+| `all` | все четыре |
+
+Примеры: `--proxies all`, `--proxies proxifly,monosans`,
+`--proxies all,my-proxies.txt`. Формат своих списков: JSON proxifly,
+JSON-массив строк или текст по строке на прокси (`socks5://host:port`,
+`http://user:pass@host:port`, `host:port` считается http). SOCKS с логином
+пропускается: Chromium не умеет авторизоваться на SOCKS. Логин прокси в логи не
+пишется. Сколько прокси и раундов дал каждый список, видно в логе (`proxies:`
+раз в 5 минут) и в `run.json` → `egress.bySource`.
 
 - список перечитывается каждые `--proxy-refresh` секунд (600);
 - прокси проверяются в фоне (`--proxy-check-concurrency` 50) и только пока

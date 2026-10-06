@@ -55,12 +55,25 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 DEFAULT_URL = "https://3oaks.com/api/v1/games/moon_sisters/play?lang=en"
 PROXIFLY_URL = (
     "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/all/data.json"
 )
+PROXIO = "https://raw.githubusercontent.com/proxio-io/proxy-list/main"
+# Built-in free lists for `--proxies`: name -> [(scheme for bare lines, URL)].
+PROXY_SOURCES: dict[str, list[tuple[str, str]]] = {
+    "proxifly": [("http", PROXIFLY_URL)],
+    "proxyscrape": [("http", "https://cdn.jsdelivr.net/gh/proxyscrape/"
+                              "free-proxy-list@main/proxies/all/data.txt")],
+    # proxio lines carry no scheme, so each protocol comes from its own file;
+    # its "https" list is HTTP proxies that tunnel HTTPS.
+    "proxio": [("http", f"{PROXIO}/http.txt"), ("http", f"{PROXIO}/https.txt"),
+               ("socks4", f"{PROXIO}/socks4.txt"), ("socks5", f"{PROXIO}/socks5.txt")],
+    "monosans": [("http", "https://raw.githubusercontent.com/monosans/"
+                           "proxy-list/main/proxies/all.txt")],
+}
 PROXY_SCHEMES = {"http", "https", "socks4", "socks5"}
 SESSION_SEGMENT = re.compile(r"/desktop/([0-9A-Za-z]{8,})/demo/")
 OK_CODES = {"OK", "SUCCESS", ""}
@@ -167,10 +180,12 @@ def parse_launch(html: str) -> tuple[str, str]:
     return endpoint, token.group(1)
 
 
-def load_proxy_list(source: str) -> list[str]:
-    """Read proxies from a file or URL: proxifly JSON, JSON strings or text lines."""
-    if source == "proxifly":
-        source = PROXIFLY_URL
+def load_proxy_list(source: str, default_scheme: str = "http") -> list[str]:
+    """Read proxies from a file or URL: proxifly JSON, JSON strings or text lines.
+
+    Lines without a scheme get `default_scheme`. SOCKS proxies with a login
+    are skipped: Chromium cannot authenticate to them.
+    """
     if re.match(r"https?://", source) and not Path(source).exists():
         with urllib.request.urlopen(source, timeout=60) as response:
             text = response.read().decode("utf-8", errors="replace")
@@ -188,14 +203,65 @@ def load_proxy_list(source: str) -> list[str]:
             continue
         value = value.strip()
         if "://" not in value:
-            value = "http://" + value
+            value = f"{default_scheme}://{value}"
         try:
             parts = urlsplit(value)
-            if parts.scheme.lower() in PROXY_SCHEMES and parts.hostname and parts.port:
+            scheme = parts.scheme.lower()
+            if (scheme in PROXY_SCHEMES and parts.hostname and parts.port
+                    and not (scheme.startswith("socks") and parts.username)):
                 servers.append(value)
         except ValueError:
             continue
     return list(dict.fromkeys(servers))
+
+
+def expand_sources(spec: str) -> list[tuple[str, str, str]]:
+    """Turn `--proxies` into (label, default scheme, location) entries.
+
+    Comma-separated; each item is a built-in name (`all` means every one),
+    a file path or a URL.
+    """
+    entries: list[tuple[str, str, str]] = []
+    for item in (part.strip() for part in spec.split(",")):
+        if not item:
+            continue
+        names = list(PROXY_SOURCES) if item == "all" else [item]
+        for name in names:
+            if name in PROXY_SOURCES:
+                entries += [(name, scheme, url) for scheme, url in PROXY_SOURCES[name]]
+            else:
+                entries.append((name, "http", name))
+    return list(dict.fromkeys(entries))
+
+
+def load_proxy_sources(spec: str) -> tuple[dict[str, list[str]], dict[str, str]]:
+    """Load every source in `spec`; one failing list does not stop the others."""
+    loaded: dict[str, list[str]] = {}
+    errors: dict[str, str] = {}
+    for label, scheme, location in expand_sources(spec):
+        try:
+            servers = load_proxy_list(location, scheme)
+            loaded.setdefault(label, []).extend(servers)
+        except Exception as error:  # noqa: BLE001 - reported, other lists still load
+            errors[f"{label} {location.rsplit('/', 1)[-1]}"] = (
+                f"{type(error).__name__}: {error}"[:120])
+    return loaded, errors
+
+
+def proxy_key(server: str) -> str:
+    """host:port, so one proxy listed by several sources counts once."""
+    parts = urlsplit(server)
+    return f"{(parts.hostname or '').lower()}:{parts.port}"
+
+
+def proxy_settings(server: str) -> dict[str, str]:
+    """Playwright proxy settings; a login in the URL becomes username/password."""
+    parts = urlsplit(server)
+    settings = {"server": f"{parts.scheme}://{parts.netloc.rsplit('@', 1)[-1]}"}
+    if parts.username:
+        settings["username"] = unquote(parts.username)
+        settings["password"] = unquote(parts.password or "")
+    return settings
 
 
 def merge_round(steps: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]]]:
@@ -254,9 +320,12 @@ class RunState:
 class Lane:
     """One egress IP: its own request budget and 429 cooldown."""
 
-    def __init__(self, server: str | None, rate: float, capacity: int) -> None:
+    def __init__(self, server: str | None, rate: float, capacity: int,
+                 source: str | None = None) -> None:
         self.server = server
-        self.label = urlsplit(server).netloc if server else "direct"
+        self.source = source
+        # Never log a proxy login: the label is host:port only.
+        self.label = urlsplit(server).netloc.rsplit("@", 1)[-1] if server else "direct"
         self.interval = 1.0 / rate
         self.capacity = capacity
         self.in_use = 0
@@ -306,8 +375,11 @@ class LanePool:
         self.lanes: list[Lane] = []
         self.candidates: list[str] = []
         self.seen: set[str] = set()
+        self.source_of: dict[str, str] = {}
+        self.listed: dict[str, int] = {}
         self.checked = 0
         self.loaded_at = float("-inf")
+        self.reported_at = float("-inf")
         if self.direct:
             self.lanes.append(Lane(None, args.rate, capacity=args.workers))
 
@@ -353,7 +425,7 @@ class LanePool:
     async def check(self, server: str) -> bool:
         try:
             context = await self.playwright.request.new_context(
-                proxy={"server": server},
+                proxy=proxy_settings(server),
                 timeout=self.args.proxy_check_timeout * 1000,
             )
         except Exception:  # noqa: BLE001 - unusable proxy definition
@@ -369,6 +441,37 @@ class LanePool:
             with contextlib.suppress(Exception):
                 await context.dispose()
 
+    def add_candidates(self, loaded: dict[str, list[str]]) -> dict[str, int]:
+        """Queue proxies not seen before, from any source; returns new per source."""
+        added: dict[str, int] = {}
+        for label, servers in loaded.items():
+            fresh = []
+            for server in servers:
+                key = proxy_key(server)
+                if key in self.seen:
+                    continue
+                self.seen.add(key)
+                self.source_of[server] = label
+                fresh.append(server)
+            added[label] = len(fresh)
+            self.listed[label] = self.listed.get(label, 0) + len(fresh)
+            self.candidates.extend(fresh)
+        random.shuffle(self.candidates)
+        return added
+
+    def pool_line(self, added: dict[str, int] | None = None) -> str:
+        usable: dict[str, int] = {}
+        for lane in self.lanes:
+            if not lane.dead:
+                usable[lane.source or "?"] = usable.get(lane.source or "?", 0) + 1
+        new = ""
+        if added is not None:
+            parts = ", ".join(f"{label} +{count}" for label, count in added.items())
+            new = f"+{sum(added.values())} new ({parts}), "
+        by_source = ", ".join(f"{label} {count}" for label, count in sorted(usable.items()))
+        return (f"proxies: {new}{len(self.candidates)} to check, {self.usable()} usable"
+                + (f" ({by_source})" if by_source else ""))
+
     async def run_checker(self, state: RunState) -> None:
         if self.direct:
             return
@@ -377,22 +480,23 @@ class LanePool:
             ok = await self.check(server)
             self.checked += 1
             if ok and not state.stop:
-                self.lanes.append(Lane(server, self.args.rate, self.args.workers_per_proxy))
+                self.lanes.append(Lane(server, self.args.rate, self.args.workers_per_proxy,
+                                       source=self.source_of.get(server)))
 
         while not state.stop:
             if time.monotonic() - self.loaded_at >= self.args.proxy_refresh:
-                try:
-                    servers = await asyncio.to_thread(load_proxy_list, self.args.proxies)
-                    fresh = [server for server in servers if server not in self.seen]
-                    self.seen.update(fresh)
-                    random.shuffle(fresh)
-                    self.candidates.extend(fresh)
-                    self.loaded_at = time.monotonic()
-                    print(f"proxies: +{len(fresh)} new, {len(self.candidates)} to check, "
-                          f"{self.usable()} usable", flush=True)
-                except Exception as error:  # noqa: BLE001 - retry the list soon
-                    print(f"proxy list load failed: {error}", flush=True)
-                    self.loaded_at = time.monotonic() - self.args.proxy_refresh + 30
+                loaded, errors = await asyncio.to_thread(load_proxy_sources, self.args.proxies)
+                for label, error in errors.items():
+                    print(f"proxy list {label} failed: {error}", flush=True)
+                added = self.add_candidates(loaded)
+                # Retry soon if every list failed, otherwise on the normal schedule.
+                self.loaded_at = time.monotonic() - (
+                    0 if loaded else self.args.proxy_refresh - 30)
+                self.reported_at = time.monotonic()
+                print(self.pool_line(added), flush=True)
+            elif time.monotonic() - self.reported_at >= 300:
+                self.reported_at = time.monotonic()
+                print(self.pool_line(), flush=True)
 
             now = time.monotonic()
             spare = sum(lane.capacity - lane.in_use for lane in self.lanes
@@ -409,6 +513,14 @@ class LanePool:
         if self.direct:
             return {"mode": "direct"}
         busiest = sorted(self.lanes, key=lambda lane: lane.rounds, reverse=True)[:20]
+        by_source = {label: {"listed": count, "passedCheck": 0, "dead": 0, "rounds": 0}
+                     for label, count in self.listed.items()}
+        for lane in self.lanes:
+            entry = by_source.setdefault(lane.source or "?", {
+                "listed": 0, "passedCheck": 0, "dead": 0, "rounds": 0})
+            entry["passedCheck"] += 1
+            entry["dead"] += lane.dead
+            entry["rounds"] += lane.rounds
         return {
             "mode": "proxies",
             "source": self.args.proxies,
@@ -416,7 +528,9 @@ class LanePool:
             "checked": self.checked,
             "passedCheck": len(self.lanes),
             "dead": sum(lane.dead for lane in self.lanes),
-            "top": [{"proxy": lane.label, "rounds": lane.rounds} for lane in busiest],
+            "bySource": by_source,
+            "top": [{"proxy": lane.label, "source": lane.source, "rounds": lane.rounds}
+                    for lane in busiest],
         }
 
 
@@ -488,7 +602,7 @@ async def open_page(browsers: BrowserPool, lane: Lane, args: argparse.Namespace,
     options: dict[str, Any] = {"viewport": {"width": 1280, "height": 720},
                                "locale": "en-US"}
     if lane.server:
-        options["proxy"] = {"server": lane.server}
+        options["proxy"] = proxy_settings(lane.server)
     context = await browser.new_context(**options)
     try:
         # Only the page itself and our own game commands go out: the game
@@ -1042,7 +1156,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--session-cost", type=float, default=3.0,
                         help="Request budget charged for opening one session")
     parser.add_argument("--proxies",
-                        help="Proxy list: file, URL, or 'proxifly' for the free proxifly list")
+                        help="Comma-separated proxy sources: built-in "
+                             f"{', '.join(PROXY_SOURCES)} or 'all', a file or a URL")
     parser.add_argument("--workers-per-proxy", type=int, default=1)
     parser.add_argument("--proxy-check-concurrency", type=int, default=50)
     parser.add_argument("--proxy-check-timeout", type=float, default=15.0)

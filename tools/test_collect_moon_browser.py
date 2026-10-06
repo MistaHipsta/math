@@ -289,6 +289,60 @@ class LaunchAndProxyListTests(unittest.TestCase):
                              ["socks5://1.2.3.4:1080"])
             self.assertEqual(collector.load_proxy_list(str(as_text)),
                              ["http://5.6.7.8:3128", "socks4://9.9.9.9:4145"])
+            self.assertEqual(collector.load_proxy_list(str(as_text), "socks5"),
+                             ["socks5://5.6.7.8:3128", "socks4://9.9.9.9:4145"])
+
+    def test_proxy_login_is_passed_to_playwright_and_never_logged(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "p.txt"
+            path.write_text("http://user:pa%40ss@1.2.3.4:8080\n"
+                            "socks5://user:pw@5.6.7.8:1080\n", encoding="utf-8")
+            servers = collector.load_proxy_list(str(path))
+        self.assertEqual(servers, ["http://user:pa%40ss@1.2.3.4:8080"])  # SOCKS login dropped
+        self.assertEqual(collector.proxy_settings(servers[0]), {
+            "server": "http://1.2.3.4:8080", "username": "user", "password": "pa@ss"})
+        self.assertEqual(collector.proxy_settings("socks5://5.6.7.8:1080"),
+                         {"server": "socks5://5.6.7.8:1080"})
+        self.assertEqual(collector.Lane(servers[0], 1.0, 1).label, "1.2.3.4:8080")
+
+    def test_expand_sources(self) -> None:
+        everything = {label for label, _, _ in collector.expand_sources("all")}
+        self.assertEqual(everything, {"proxifly", "proxyscrape", "proxio", "monosans"})
+        mixed = collector.expand_sources("proxio, my.txt")
+        self.assertEqual([scheme for label, scheme, _ in mixed if label == "proxio"],
+                         ["http", "http", "socks4", "socks5"])
+        self.assertIn(("my.txt", "http", "my.txt"), mixed)
+
+    def test_one_failing_source_does_not_stop_the_others(self) -> None:
+        def fake(location: str, scheme: str = "http") -> list[str]:
+            if "monosans" in location:
+                raise OSError("down")
+            return [f"{scheme}://1.1.1.{len(location) % 200}:80"]
+
+        original = collector.load_proxy_list
+        collector.load_proxy_list = fake
+        try:
+            loaded, errors = collector.load_proxy_sources("all")
+        finally:
+            collector.load_proxy_list = original
+        self.assertEqual(set(loaded), {"proxifly", "proxyscrape", "proxio"})
+        self.assertEqual(len(loaded["proxio"]), 4)
+        self.assertEqual(list(errors), ["monosans all.txt"])
+
+    def test_same_proxy_from_several_sources_is_checked_once(self) -> None:
+        pool = collector.LanePool(None, collector.parse_args(["--proxies", "all"]))
+        added = pool.add_candidates({
+            "proxifly": ["socks5://1.2.3.4:1080", "http://5.6.7.8:80"],
+            "monosans": ["http://1.2.3.4:1080", "socks4://9.9.9.9:4145"],
+        })
+        self.assertEqual(added, {"proxifly": 2, "monosans": 1})
+        self.assertEqual(sorted(pool.candidates), [
+            "http://5.6.7.8:80", "socks4://9.9.9.9:4145", "socks5://1.2.3.4:1080"])
+        self.assertEqual(pool.add_candidates({"proxio": ["socks5://1.2.3.4:1080"]}),
+                         {"proxio": 0})
+        pool.lanes = [collector.Lane("socks4://9.9.9.9:4145", 1.0, 1, source="monosans")]
+        self.assertIn("usable (monosans 1)", pool.pool_line())
+        self.assertEqual(pool.summary()["bySource"]["monosans"]["passedCheck"], 1)
 
 
 if __name__ == "__main__":

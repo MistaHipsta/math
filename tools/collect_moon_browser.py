@@ -596,8 +596,13 @@ def throttle(lane: Lane, state: RunState, args: argparse.Namespace,
 
 
 async def open_page(browsers: BrowserPool, lane: Lane, args: argparse.Namespace,
-                    state: RunState, timeout: float | None = None) -> tuple[Any, Any, str]:
-    """Open a context on the lane and load the game page HTML (no client)."""
+                    state: RunState, timeout: float | None = None,
+                    allow: tuple[str, ...] = ("gsc=",)) -> tuple[Any, Any, str]:
+    """Open a context on the lane and load the game page HTML (no client).
+
+    Besides the page itself only requests whose URL contains one of `allow`
+    (the game API) go out.
+    """
     browser = await browsers.get()
     options: dict[str, Any] = {"viewport": {"width": 1280, "height": 720},
                                "locale": "en-US"}
@@ -609,7 +614,7 @@ async def open_page(browsers: BrowserPool, lane: Lane, args: argparse.Namespace,
         # client, assets and telemetry would cost proxy bandwidth and budget.
         async def gate(route: Any) -> None:
             request = route.request
-            if request.resource_type == "document" or "gsc=" in request.url:
+            if request.resource_type == "document" or any(m in request.url for m in allow):
                 await route.continue_()
             else:
                 await route.abort()

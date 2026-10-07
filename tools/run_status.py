@@ -1,4 +1,4 @@
-"""Live metrics for a running `collect_moon_browser.py` run.
+"""Live metrics for a running `collect_moon_browser.py` or `collect_maxwin.py` run.
 
 Reads only the bytes appended since the previous call (offsets are cached in
 `<run>/.status-cache.json`), so it stays fast on multi-gigabyte runs and is
@@ -32,7 +32,9 @@ def fresh_counters() -> dict[str, Any]:
 
 def absorb(counters: dict[str, Any], event: dict[str, Any], now: float) -> None:
     kind = event.get("type")
-    if kind == "round_response":
+    if kind == "round_response" and event.get("platform") == "maxwin":
+        absorb_maxwin(counters, event, now)
+    elif kind == "round_response":
         response = event["response"]
         steps = response.get("steps") or []
         counters["rounds"] += 1
@@ -58,9 +60,41 @@ def absorb(counters: dict[str, Any], event: dict[str, Any], now: float) -> None:
         counters["midBonusMigrations"] += bool(event.get("midBonus"))
     elif kind == "session_error":
         counters["sessionErrors"] += 1
-        counters["abandoned"] += bool(event.get("abandonedSteps"))
+        counters["abandoned"] += bool(event.get("abandonedSteps") or event.get("abandoned"))
     elif kind == "throttled":
         counters["throttled"] += 1
+
+
+def absorb_maxwin(counters: dict[str, Any], event: dict[str, Any], now: float) -> None:
+    """A MaxWin round: the whole bonus is inside one answer. Money in x100 stake."""
+    response = event["response"]
+    mode = event.get("mode", "base")
+    counters["rounds"] += 1
+    by_mode = counters.setdefault("modes", {}).setdefault(
+        mode, {"rounds": 0, "stake": 0, "payout": 0, "bonus": 0})
+    by_mode["rounds"] += 1
+    counters["recovered"] = counters.get("recovered", 0) + bool(response.get("recovered"))
+    try:
+        game = response["game"]
+        stake = float(response["stake"])
+        payout = round(float(game["win"]["total"]) / stake * 100)
+        cost = 100 * (counters.get("buyPrice", 100) if mode == "bonus" else 1)
+        free = (game["nsp"].get("freeSpins") or {}).get("spins") or []
+    except (KeyError, ValueError, TypeError, ZeroDivisionError):
+        counters["badLines"] += 1
+        return
+    by_mode["stake"] += cost
+    by_mode["payout"] += payout
+    counters["stake"] += cost
+    counters["payout"] += payout
+    counters["maxPayout"] = max(counters["maxPayout"], payout)
+    if free:
+        counters["bonus"] += 1
+        by_mode["bonus"] += 1
+        counters["bonusSteps"] += len(free)
+        counters["maxBonusSteps"] = max(counters["maxBonusSteps"], len(free))
+    if event.get("egress"):
+        counters["egress"][event["egress"]] = now
 
 
 def scan(run_dir: Path) -> tuple[dict[str, Any], float]:
@@ -163,6 +197,13 @@ def report(run_dir: Path) -> str:
         f"proxies       {active_ips} produced rounds in last 10 min",
         f"disk          {size / 2**30:.2f} GiB, last write {int(idle) if idle is not None else '?'}s ago",
     ]
+    for mode, stats in sorted((counters.get("modes") or {}).items()):
+        mode_rtp = stats["payout"] / stats["stake"] if stats["stake"] else 0
+        share = stats["bonus"] / stats["rounds"] if stats["rounds"] else 0
+        lines.append(f"mode {mode:<8} {stats['rounds']:,} rounds, bonuses {stats['bonus']:,} "
+                     f"({share:.2%}), RTP {mode_rtp:.4f}")
+    if "recovered" in counters:
+        lines.append(f"recovered     {counters['recovered']}   <- lost answers read back from history")
     if counters["badLines"]:
         lines.append(f"bad lines     {counters['badLines']}")
     if progress:

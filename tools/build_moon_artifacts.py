@@ -1,9 +1,19 @@
-"""Build streaming Stake and Mooncoin/GBR math artifacts from collector JSONL."""
+"""Build streaming Stake and Mooncoin/GBR math artifacts from collector JSONL.
+
+One run:   build_moon_artifacts.py --root <run>
+Merged:    build_moon_artifacts.py --merge <run> <run> ... --out <folder>
+
+A merge takes every worker file of every listed run, counts a file that is
+byte-identical to one already taken once (a copied run folder), and refuses
+rounds without bonus step history, so all rounds share one RTP. Runs that
+were stopped have no run.json; their bet is read from the rounds.
+"""
 from __future__ import annotations
 
 import argparse
 import csv
 from contextlib import ExitStack
+import hashlib
 import json
 import os
 import shutil
@@ -196,13 +206,53 @@ def write_line(stream: Any, value: dict[str, Any]) -> None:
     stream.write(data + "\n")
 
 
+def file_digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def iter_merged(roots: list[Path], sources: dict[str, Any]) -> Iterator[tuple[Path, dict[str, Any]]]:
+    """Rounds of every worker file under `roots`; identical copies are read once.
+
+    Fills `sources` with what was taken and skipped, for the audit report.
+    """
+    seen: dict[str, str] = {}
+    for root in roots:
+        files = sorted(root.glob("MoonSisters-worker-*.jsonl"))
+        if not files:
+            raise ValueError(f"No MoonSisters worker files in {root}")
+        entry = sources.setdefault(str(root), {"files": 0, "duplicateFiles": 0, "rounds": 0})
+        for path in files:
+            digest = file_digest(path)
+            if digest in seen:
+                entry["duplicateFiles"] += 1
+                continue
+            seen[digest] = str(path)
+            entry["files"] += 1
+            with path.open(encoding="utf-8") as stream:
+                for line in stream:
+                    if not line.strip():
+                        continue
+                    if not line.endswith("\n"):
+                        break  # cut by a stopped collector: not a finished round
+                    event = json.loads(line)
+                    if event.get("type") == "round_response":
+                        entry["rounds"] += 1
+                        yield path, event
+
+
+def merged_problem(event: dict[str, Any]) -> str | None:
+    """In a merge every round needs step history, so bonuses are never summaries."""
+    if not isinstance((event.get("response") or {}).get("playHistory"), list):
+        return "round has no step history"
+    return incomplete_round(event)
+
+
 def convert(root: Path, workers: int) -> dict[str, Any]:
-    try:
-        import zstandard as zstd
-    except ImportError as exc:
-        raise RuntimeError("Install requirements-artifacts.txt to create .zst artifacts") from exc
-    manifest_path = root / "run.json"
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest = json.loads((root / "run.json").read_text(encoding="utf-8"))
     expected_count = manifest.get("roundsCollected")
     if type(expected_count) is not int or expected_count <= 0:
         raise ValueError("run.json does not contain completed round count")
@@ -212,7 +262,23 @@ def convert(root: Path, workers: int) -> dict[str, Any]:
     if any(type(value) is not int or value <= 0 for value in bet_fields):
         raise ValueError("run.json contains invalid bet configuration")
     expected_bet = bet_fields[0] * bet_fields[1] * bet_fields[2]
-    parent = root / "converted-artifact"
+    return write_artifacts(root / "converted-artifact", iter_rounds(root, workers),
+                           incomplete_round, expected_bet, expected_count, {})
+
+
+def convert_merged(roots: list[Path], out: Path, bet: int = 100) -> dict[str, Any]:
+    """One artifact from several runs; rounds are trusted to agree on `bet`."""
+    sources: dict[str, Any] = {}
+    return write_artifacts(out, iter_merged(roots, sources), merged_problem, bet, None, sources)
+
+
+def write_artifacts(parent: Path, rounds: Iterator[tuple[Path, dict[str, Any]]],
+                    problem_of: Any, expected_bet: int, expected_count: int | None,
+                    sources: dict[str, Any]) -> dict[str, Any]:
+    try:
+        import zstandard as zstd
+    except ImportError as exc:
+        raise RuntimeError("Install requirements-artifacts.txt to create .zst artifacts") from exc
     destinations = {name: parent / name for name in ("stake", "artube")}
     parent.mkdir(parents=True, exist_ok=True)
     for destination in destinations.values():
@@ -220,7 +286,6 @@ def convert(root: Path, workers: int) -> dict[str, Any]:
             raise FileExistsError(f"Output already exists: {destination}")
     temporary = Path(tempfile.mkdtemp(prefix="moon-convert-", dir=parent))
     outputs: dict[str, Any] = {}
-    compressor = zstd.ZstdCompressor(level=3)
     summary = {"rounds": 0, "bonusRounds": 0, "incompleteLegacyBonusRounds": 0,
                "rejectedIncompleteRounds": 0, "rejectedReasons": {},
                "stakePayoutTotal": 0, "artubePayoutTotal": 0,
@@ -232,14 +297,16 @@ def convert(root: Path, workers: int) -> dict[str, Any]:
         for name in destinations:
             (temporary / name).mkdir()
             target = stack.enter_context((temporary / name / "books_base.jsonl.zst").open("wb"))
-            encoded = compressor.stream_writer(target, closefd=False)
+            # One compressor per stream: a shared one interleaves both outputs
+            # into a single zstd context and corrupts the files.
+            encoded = zstd.ZstdCompressor(level=3).stream_writer(target, closefd=False)
             outputs[name] = stack.enter_context(__import__("io").TextIOWrapper(encoded, encoding="utf-8", newline="\n"))
         csv_tmp = temporary / "weights.csv"
         with csv_tmp.open("w", encoding="utf-8", newline="") as weight_file:
             weights = csv.writer(weight_file, lineterminator="\n")
             index = 0
-            for _, event in iter_rounds(root, workers):
-                problem = incomplete_round(event)
+            for _, event in rounds:
+                problem = problem_of(event)
                 if problem is not None:
                     summary["rejectedIncompleteRounds"] += 1
                     reasons = summary["rejectedReasons"]
@@ -260,8 +327,12 @@ def convert(root: Path, workers: int) -> dict[str, Any]:
         stack.close()
         outputs.clear()
         seen = summary["rounds"] + summary["rejectedIncompleteRounds"]
-        if seen != expected_count:
+        if expected_count is not None and seen != expected_count:
             raise ValueError(f"run.json says {expected_count} rounds, but found {seen}")
+        if not summary["rounds"]:
+            raise ValueError("no complete rounds to write")
+        if sources:
+            summary["sources"] = sources
         summary["totalStake"] = summary["rounds"] * summary["betCredits"]
         summary["lookupRows"] = summary["rounds"]
         summary["rtp"] = summary["stakePayoutTotal"] / summary["totalStake"] if summary["totalStake"] else None
@@ -296,12 +367,22 @@ def convert(root: Path, workers: int) -> dict[str, Any]:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--root", required=True, type=Path)
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--root", type=Path, help="One finished run with run.json")
+    source.add_argument("--merge", type=Path, nargs="+", help="Several runs into one artifact")
+    parser.add_argument("--out", type=Path, help="Output folder for --merge")
+    parser.add_argument("--bet", type=int, default=100, help="Round bet in credits for --merge")
     parser.add_argument("--workers", type=int, default=10)
     args = parser.parse_args()
+    if args.merge and not args.out:
+        parser.error("--merge needs --out")
     try:
-        print(json.dumps(convert(args.root, args.workers), indent=2))
+        report = (convert_merged(args.merge, args.out, args.bet) if args.merge
+                  else convert(args.root, args.workers))
+        print(json.dumps({k: v for k, v in report.items() if k != "payoutDistribution"},
+                         indent=2))
     except Exception as exc:
         print(f"artifact conversion failed: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1

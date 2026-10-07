@@ -105,6 +105,30 @@ class BuildMoonArtifactsTests(unittest.TestCase):
             context["actions"] = [offered]
         return history
 
+    def test_merge_reads_copies_once_and_skips_rounds_without_history(self) -> None:
+        base = self.write_round([ctx("spin", finished=True)], payout=40, bonus_steps=0)
+        bonus = self.write_round(self.bonus_history(), payout=3200, bonus_steps=3)
+        legacy = self.write_round([ctx("spin", finished=True)], payout=60, bonus_steps=0)
+        legacy["response"].pop("playHistory")
+        runs = [Path(self.temp.name) / name for name in ("a", "copy-of-a", "b")]
+        for run in runs:
+            run.mkdir()
+        for run in runs[:2]:  # the same file in two folders
+            (run / "MoonSisters-worker-01-x.jsonl").write_text(
+                json.dumps(base) + "\n" + json.dumps(bonus) + "\n")
+        (runs[2] / "MoonSisters-worker-01-y.jsonl").write_text(
+            json.dumps(legacy) + "\n" + json.dumps(base) + "\n" + json.dumps(base)[:30])
+        out = Path(self.temp.name) / "merged"
+
+        report = builder.convert_merged(runs, out)
+        self.assertEqual(report["rounds"], 3)
+        self.assertEqual(report["bonusRounds"], 1)
+        self.assertEqual(report["rejectedReasons"], {"round has no step history": 1})
+        self.assertEqual(report["stakePayoutTotal"], 3280)
+        self.assertEqual(report["sources"][str(runs[1])]["duplicateFiles"], 1)
+        weights = (out / "stake" / "lookUpTable_base_0.csv").read_text().splitlines()
+        self.assertEqual(weights, ["1,1,40", "2,1,3200", "3,1,40"])
+
     def test_incomplete_bonus_never_reaches_artifacts(self) -> None:
         base = self.write_round([ctx("spin", finished=True)], payout=40, bonus_steps=0)
         complete = self.write_round(self.bonus_history(), payout=3200, bonus_steps=3)
@@ -175,6 +199,30 @@ class BuildMoonArtifactsTests(unittest.TestCase):
         self.assertFalse(book["events"][0]["historyAvailable"])
         self.assertEqual(book["events"][0]["actions"][0]["action"], "bonusSummaryOnly")
         self.assertEqual(book["events"][0]["actions"][0]["collectedCoinValues"][2][1], 5)
+
+
+class RealZstdTests(unittest.TestCase):
+    """Round-trip through the real zstandard module, not the fake one."""
+
+    def test_both_books_decompress_to_every_round(self) -> None:
+        import zstandard
+
+        with tempfile.TemporaryDirectory() as folder:
+            run = Path(folder) / "run"
+            run.mkdir()
+            history = [ctx("spin", finished=True, coin=True)]
+            final = dict(history[-1], spins=dict(history[-1]["spins"], round_bet=100,
+                                                  round_win=40, total_win=40, bonus_steps=0))
+            event = {"type": "round_response", "response": {
+                "RawJson": json.dumps({"command": "play", "context": final}),
+                "playHistory": history}}
+            lines = json.dumps(event) + "\n"
+            (run / "MoonSisters-worker-01-x.jsonl").write_text(lines * 3000)
+            builder.convert_merged([run], Path(folder) / "out")
+            for name in ("stake", "artube"):
+                raw = (Path(folder) / "out" / name / "books_base.jsonl.zst").read_bytes()
+                text = zstandard.ZstdDecompressor().decompressobj().decompress(raw)
+                self.assertEqual(text.count(b"\n"), 3000, name)
 
 
 if __name__ == "__main__":
